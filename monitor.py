@@ -1,25 +1,3 @@
-"""
-Melbet live football monitor - single-run version for GitHub Actions.
-
-Each invocation:
-  1. Opens a headless browser, establishes a session on the live page
-  2. Fetches the games1x2 live-feed endpoint once
-  3. Checks every match at minute >= 70 for any Over/Under (Total Goals)
-     line with odds <= 1.02
-  4. Sends an email for any new qualifying match (via GitHub Secrets)
-  5. Records alerted match IDs in alerts.json, keyed by date, so the
-     same match isn't alerted twice in one day
-  6. Exits. The GitHub Actions workflow commits alerts.json back to the
-     repo if it changed, giving persistence across runs without any
-     external database.
-
-NOTE: Scraping MelBet's live-feed endpoints this way is very likely
-outside their Terms of Service, and running it unattended increases
-that exposure. This is for personal/educational use - use at your own
-discretion. Odds near 1.01-1.02 late in a match are not risk-free
-(stoppage-time goals, red cards, VAR overturns can still happen).
-"""
-
 import json
 import os
 import re
