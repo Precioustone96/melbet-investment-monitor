@@ -1,6 +1,8 @@
 name: Melbet Monitor
 
 on:
+  repository_dispatch:
+    types: [run-monitor]
   schedule:
     - cron: "*/5 * * * *"
 
