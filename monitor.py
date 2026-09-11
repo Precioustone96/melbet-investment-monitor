@@ -1,23 +1,18 @@
 """
-Melbet live football monitor - single-run version for GitHub Actions.
+MelBet Live Football Monitor
 
-Each invocation:
-  1. Opens a headless browser, establishes a session on the live page
-  2. Fetches the games1x2 live-feed endpoint once
-  3. Checks every match at minute >= 70 for any Over/Under (Total Goals)
-     line with odds <= 1.02
-  4. Sends an email for any new qualifying match (via GitHub Secrets)
-  5. Records alerted match IDs in alerts.json, keyed by date, so the
-     same match isn't alerted twice in one day
-  6. Exits. The GitHub Actions workflow commits alerts.json back to the
-     repo if it changed, giving persistence across runs without any
-     external database.
+Checks live football matches for:
 
-NOTE: Scraping MelBet's live-feed endpoints this way is very likely
-outside their Terms of Service, and running it unattended increases
-that exposure. This is for personal/educational use - use at your own
-discretion. Odds near 1.01-1.02 late in a match are not risk-free
-(stoppage-time goals, red cards, VAR overturns can still happen).
+    - Match minute >= 70
+    - Any Total Goals Over/Under option
+    - Odds <= 1.02
+
+When a match qualifies:
+    - Sends an email with the subject "Investment Alert"
+    - Records the match ID in alerts.json
+    - Does not send another alert for that same match on the same day
+
+Designed to run once per GitHub Actions invocation.
 """
 
 import json
@@ -25,16 +20,29 @@ import os
 import re
 import smtplib
 import sys
-from datetime import date, datetime, timezone
+from datetime import datetime
 from email.mime.text import MIMEText
+from zoneinfo import ZoneInfo
 
 from playwright.sync_api import sync_playwright
 
-# ---------- CONFIG ----------
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
 LIVE_PAGE_URL = "https://melbet.com/en/live/football"
+
 GAMES_API_URL = (
     "https://melbet.com/service-api/main-live-feed/v3/games1x2"
-    "?cfView=3&count=40&fcountry=132&gr=62&grMode=4&lng=en&ref=8&selectedMs=1.1,2.1,10.1"
+    "?cfView=3"
+    "&count=40"
+    "&fcountry=132"
+    "&gr=62"
+    "&grMode=4"
+    "&lng=en"
+    "&ref=8"
+    "&selectedMs=1.1,2.1,10.1"
 )
 
 MINUTE_THRESHOLD = 70
@@ -42,157 +50,602 @@ ODDS_THRESHOLD = 1.02
 
 ALERTS_FILE = "alerts.json"
 
-# --- Email settings, pulled from GitHub Actions secrets (env vars) ---
+# Nigeria timezone
+TIMEZONE = ZoneInfo("Africa/Lagos")
+
+
+# ============================================================
+# EMAIL SETTINGS
+# ============================================================
+
 SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+
 SMTP_USER = os.environ.get("SMTP_USER")
 SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
-ALERT_TO = os.environ.get("ALERT_TO", SMTP_USER)
+
+ALERT_TO = os.environ.get("ALERT_TO")
+
+
+# ============================================================
+# DATE / ALERT STORAGE
+# ============================================================
+
+def today_string():
+    """Return today's date using Nigeria/Lagos time."""
+    return datetime.now(TIMEZONE).date().isoformat()
 
 
 def load_alerts():
+
+    today = today_string()
+
     if not os.path.exists(ALERTS_FILE):
-        return {"date": date.today().isoformat(), "alerted_ids": []}
 
-    with open(ALERTS_FILE, "r", encoding="utf-8") as f:
-        data = json.load(f)
+        return {
+            "date": today,
+            "alerted_ids": []
+        }
 
-    # Reset the list on a new UTC day (GitHub Actions runners are UTC)
-    today = date.today().isoformat()
+    try:
+
+        with open(
+            ALERTS_FILE,
+            "r",
+            encoding="utf-8"
+        ) as f:
+
+            data = json.load(f)
+
+    except (
+        json.JSONDecodeError,
+        OSError
+    ):
+
+        print(
+            "alerts.json could not be read. "
+            "Creating a new alert state."
+        )
+
+        return {
+            "date": today,
+            "alerted_ids": []
+        }
+
+    # Reset alerts when a new day begins
     if data.get("date") != today:
-        data = {"date": today, "alerted_ids": []}
+
+        return {
+            "date": today,
+            "alerted_ids": []
+        }
+
+    # Ensure alerted_ids is valid
+    if not isinstance(
+        data.get("alerted_ids"),
+        list
+    ):
+
+        data["alerted_ids"] = []
 
     return data
 
 
 def save_alerts(data):
-    with open(ALERTS_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+
+    with open(
+        ALERTS_FILE,
+        "w",
+        encoding="utf-8"
+    ) as f:
+
+        json.dump(
+            data,
+            f,
+            indent=2
+        )
 
 
-def parse_minute(status_line_str):
-    if not status_line_str:
+# ============================================================
+# MATCH MINUTE
+# ============================================================
+
+def get_match_minute(match):
+
+    scores = match.get("scores") or {}
+
+    status = scores.get(
+        "statusLineStr",
+        ""
+    )
+
+    if not status:
         return None
-    m = re.search(r"(\d+)\s*minutes?", status_line_str)
-    return int(m.group(1)) if m else None
 
+    # Example:
+    # "85 minutes"
+    match_minute = re.search(
+        r"(\d+)\s*minutes?",
+        status,
+        re.IGNORECASE
+    )
+
+    if match_minute:
+
+        return int(
+            match_minute.group(1)
+        )
+
+    return None
+
+
+# ============================================================
+# FIND QUALIFYING TOTAL GOALS ODDS
+# ============================================================
 
 def find_qualifying_lines(match):
-    """Return a list of (side, parameter, cf) for any Over/Under line <= ODDS_THRESHOLD."""
-    hits = []
-    for group in match.get("centralBlockEventGroups", []):
-        if group.get("groupId") != 17:  # 17 = Total Goals
+
+    qualifying_lines = []
+
+    groups = match.get(
+        "centralBlockEventGroups",
+        []
+    )
+
+    for group in groups:
+
+        # groupId 17 = Total Goals
+        if group.get("groupId") != 17:
             continue
-        for side_events in group.get("events", []):
-            for ev in side_events:
-                cf = ev.get("cf")
-                if cf is None:
+
+        events = group.get(
+            "events",
+            []
+        )
+
+        # The API structure is:
+        #
+        # events = [
+        #     [Over events...],
+        #     [Under events...]
+        # ]
+        #
+        # type 9 = Over
+        # type 10 = Under
+
+        for event_group in events:
+
+            if not isinstance(
+                event_group,
+                list
+            ):
+                continue
+
+            for event in event_group:
+
+                if not isinstance(
+                    event,
+                    dict
+                ):
                     continue
-                if cf <= ODDS_THRESHOLD:
-                    side = "Over" if ev.get("type") == 9 else "Under"
-                    hits.append((side, ev.get("parameter"), cf))
-    return hits
+
+                event_type = event.get("type")
+
+                if event_type == 9:
+                    side = "Over"
+
+                elif event_type == 10:
+                    side = "Under"
+
+                else:
+                    continue
+
+                odd = event.get("cf")
+
+                if odd is None:
+                    continue
+
+                try:
+
+                    odd = float(odd)
+
+                except (
+                    TypeError,
+                    ValueError
+                ):
+
+                    continue
+
+                # Check the required odds condition
+                if odd <= ODDS_THRESHOLD:
+
+                    parameter = event.get(
+                        "parameter",
+                        "?"
+                    )
+
+                    qualifying_lines.append({
+                        "side": side,
+                        "parameter": parameter,
+                        "odd": odd
+                    })
+
+    return qualifying_lines
 
 
-def send_email(subject, body):
-    if not SMTP_USER or not SMTP_PASSWORD:
-        print("SMTP_USER / SMTP_PASSWORD not set - skipping email, printing alert only.")
-        return
+# ============================================================
+# SEND EMAIL
+# ============================================================
 
-    msg = MIMEText(body)
-    msg["Subject"] = subject
-    msg["From"] = SMTP_USER
-    msg["To"] = ALERT_TO
+def send_email(body):
 
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+    if not SMTP_USER:
+
+        raise RuntimeError(
+            "SMTP_USER is not configured."
+        )
+
+    if not SMTP_PASSWORD:
+
+        raise RuntimeError(
+            "SMTP_PASSWORD is not configured."
+        )
+
+    if not ALERT_TO:
+
+        raise RuntimeError(
+            "ALERT_TO is not configured."
+        )
+
+    message = MIMEText(
+        body,
+        "plain",
+        "utf-8"
+    )
+
+    # Exact email title requested
+    message["Subject"] = "Investment Alert"
+
+    message["From"] = SMTP_USER
+
+    message["To"] = ALERT_TO
+
+    with smtplib.SMTP(
+        SMTP_HOST,
+        SMTP_PORT,
+        timeout=30
+    ) as server:
+
+        server.ehlo()
+
         server.starttls()
-        server.login(SMTP_USER, SMTP_PASSWORD)
-        server.send_message(msg)
+
+        server.ehlo()
+
+        server.login(
+            SMTP_USER,
+            SMTP_PASSWORD
+        )
+
+        server.send_message(
+            message
+        )
 
 
-def check_matches(matches, alerts_data):
-    alerted_ids = set(alerts_data["alerted_ids"])
+# ============================================================
+# CHECK MATCHES
+# ============================================================
+
+def check_matches(
+    matches,
+    alerts_data
+):
+
+    alerted_ids = set(
+        str(match_id)
+        for match_id
+        in alerts_data.get(
+            "alerted_ids",
+            []
+        )
+    )
+
     new_alerts = 0
 
     for match in matches:
-        match_id = match.get("id") or match.get("mainGameId")
+
+        if not isinstance(
+            match,
+            dict
+        ):
+            continue
+
+        # Get unique match ID
+        match_id = (
+            match.get("id")
+            or match.get("mainGameId")
+        )
+
         if match_id is None:
             continue
 
-        scores = match.get("scores", {})
-        minute = parse_minute(scores.get("statusLineStr"))
-        if minute is None or minute < MINUTE_THRESHOLD:
-            continue
+        match_id = str(match_id)
 
-        hits = find_qualifying_lines(match)
-        if not hits:
-            continue
-
+        # Skip matches already alerted today
         if match_id in alerted_ids:
+
             continue
 
-        opp1 = match.get("opponent1", {}).get("fullName", "?")
-        opp2 = match.get("opponent2", {}).get("fullName", "?")
-        score = scores.get("fullScore", "?")
-        liga = match.get("liga", {}).get("name", "?")
-
-        lines_str = "\n".join(f"  {side} {param} @ {cf}" for side, param, cf in hits)
-
-        subject = f"Investment Alert: {opp1} vs {opp2} ({minute}')"
-        body = (
-            f"{liga}\n"
-            f"{opp1} vs {opp2}\n"
-            f"Minute: {minute}'\n"
-            f"Score: {score}\n\n"
-            f"Qualifying lines (odds <= {ODDS_THRESHOLD}):\n{lines_str}\n"
+        # Get match minute
+        minute = get_match_minute(
+            match
         )
 
-        print(f"\n>>> ALERT: {subject}")
-        print(body)
+        if minute is None:
+
+            continue
+
+        if minute < MINUTE_THRESHOLD:
+
+            continue
+
+        # Find Total Goals Over/Under
+        # odds <= 1.02
+        qualifying_lines = (
+            find_qualifying_lines(
+                match
+            )
+        )
+
+        if not qualifying_lines:
+
+            continue
+
+        # Match details
+        opponent1 = (
+            match.get("opponent1")
+            or {}
+        ).get(
+            "fullName",
+            "Unknown Team"
+        )
+
+        opponent2 = (
+            match.get("opponent2")
+            or {}
+        ).get(
+            "fullName",
+            "Unknown Team"
+        )
+
+        league = (
+            match.get("liga")
+            or {}
+        ).get(
+            "name",
+            "Unknown League"
+        )
+
+        scores = (
+            match.get("scores")
+            or {}
+        )
+
+        score = scores.get(
+            "fullScore",
+            "?"
+        )
+
+        # Build qualifying odds list
+        lines = []
+
+        for line in qualifying_lines:
+
+            lines.append(
+                f"{line['side']} "
+                f"{line['parameter']} "
+                f"@ {line['odd']}"
+            )
+
+        qualifying_text = "\n".join(
+            lines
+        )
+
+        # Email body
+        email_body = f"""
+INVESTMENT ALERT
+
+League: {league}
+
+Match:
+{opponent1} vs {opponent2}
+
+Minute: {minute}'
+Score: {score}
+
+Qualifying Total Goals Option(s):
+
+{qualifying_text}
+
+Match ID: {match_id}
+
+Condition:
+Minute >= {MINUTE_THRESHOLD}
+Odds <= {ODDS_THRESHOLD}
+""".strip()
+
+        print("\n" + "=" * 60)
+
+        print("QUALIFYING MATCH FOUND")
+
+        print("=" * 60)
+
+        print(email_body)
+
+        print("=" * 60)
+
+        # IMPORTANT:
+        #
+        # Only add the match to alerted_ids
+        # AFTER the email successfully sends.
 
         try:
-            send_email(subject, body)
-            print("Email sent.")
-        except Exception as e:
-            print(f"Email failed to send: {e}")
 
-        alerted_ids.add(match_id)
-        new_alerts += 1
+            send_email(
+                email_body
+            )
 
-    alerts_data["alerted_ids"] = sorted(alerted_ids)
+            print(
+                "Email sent successfully."
+            )
+
+            # Mark match as alerted ONLY
+            # after successful email delivery
+            alerted_ids.add(
+                match_id
+            )
+
+            new_alerts += 1
+
+        except Exception as error:
+
+            print(
+                "EMAIL FAILED:"
+            )
+
+            print(error)
+
+            # Do NOT save the match ID here.
+            # A future run can retry.
+
+    alerts_data[
+        "alerted_ids"
+    ] = sorted(
+        alerted_ids
+    )
+
     return new_alerts
 
 
+# ============================================================
+# MAIN
+# ============================================================
+
 def main():
-    print(f"[{datetime.now(timezone.utc).isoformat()}] Starting single-run poll...")
+
+    now = datetime.now(
+        TIMEZONE
+    )
+
+    print(
+        f"[{now.isoformat()}]"
+    )
+
+    print(
+        "Starting MelBet monitor..."
+    )
 
     alerts_data = load_alerts()
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page(viewport={"width": 1440, "height": 1000})
+
+        browser = p.chromium.launch(
+            headless=True
+        )
+
+        page = browser.new_page(
+            viewport={
+                "width": 1440,
+                "height": 1000
+            }
+        )
 
         try:
-            page.goto(LIVE_PAGE_URL, wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(5000)
 
-            resp = page.request.get(GAMES_API_URL)
-            if not resp.ok:
-                print(f"Request failed: {resp.status}")
+            print(
+                "Opening MelBet live football page..."
+            )
+
+            page.goto(
+                LIVE_PAGE_URL,
+                wait_until="domcontentloaded",
+                timeout=60000
+            )
+
+            # Give the page time to establish
+            # its session/cookies
+            page.wait_for_timeout(
+                5000
+            )
+
+            print(
+                "Fetching live match data..."
+            )
+
+            response = page.request.get(
+                GAMES_API_URL,
+                timeout=60000
+            )
+
+            if not response.ok:
+
+                print(
+                    f"API request failed: "
+                    f"{response.status}"
+                )
+
                 sys.exit(1)
 
-            matches = resp.json()
-            print(f"Got {len(matches)} matches.")
+            matches = response.json()
 
-            new_alerts = check_matches(matches, alerts_data)
-            print(f"New alerts this run: {new_alerts}")
+            # Confirm API returned a list
+            if not isinstance(
+                matches,
+                list
+            ):
+
+                print(
+                    "Unexpected API response format."
+                )
+
+                print(
+                    f"Response type: "
+                    f"{type(matches)}"
+                )
+
+                sys.exit(1)
+
+            print(
+                f"Live matches received: "
+                f"{len(matches)}"
+            )
+
+            new_alerts = (
+                check_matches(
+                    matches,
+                    alerts_data
+                )
+            )
+
+            print(
+                f"New alerts sent: "
+                f"{new_alerts}"
+            )
 
         finally:
+
             browser.close()
 
-    save_alerts(alerts_data)
-    print("Done.")
+    # Save alert state
+    save_alerts(
+        alerts_data
+    )
+
+    print(
+        "Monitor finished successfully."
+    )
 
 
 if __name__ == "__main__":
+
     main()
