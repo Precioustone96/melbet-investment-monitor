@@ -10,7 +10,7 @@ on:
 
 concurrency:
   group: melbet-monitor
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 permissions:
   contents: write
