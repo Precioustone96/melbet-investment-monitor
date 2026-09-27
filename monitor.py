@@ -788,7 +788,7 @@ def check_matches(
 
     Qualification:
 
-        Minute >= 67
+        Minute >= 65
 
         AND
 
@@ -797,7 +797,7 @@ def check_matches(
 
         AND
 
-        Odds <= 1.02
+        Odds <= 1.10
 
     R is controlled by:
 
