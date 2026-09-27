@@ -4,17 +4,17 @@ MelBet Live Football Monitor
 QUALIFICATION RULES:
 
     - Football match
-    - Match minute >= 67
+    - Match minute >= 65
     - Current score is used to calculate the required Total Goals line
     - R goal distance = 4 by default
     - Only UNDER Total Goals markets are considered
     - Required Under line must be at least R goals away from the
       current score
-    - Odds <= 1.02
+    - Odds <= 1.1
 
 Example:
 
-    Minute: 67'
+    Minute: 65'
     Score: 2-0
     Current total: 2 goals
     R: 4
@@ -24,8 +24,8 @@ Example:
 
     Therefore:
 
-        Under 5.5 @ 1.02  -> QUALIFIES
-        Under 4.5 @ 1.02  -> DOES NOT QUALIFY
+        Under 5.5 @ 1.10 -> QUALIFIES
+        Under 4.5 @ 1.11  -> DOES NOT QUALIFY
 
 When a match qualifies:
     - Sends an email with subject "Investment Alert"
@@ -77,10 +77,10 @@ GAMES_API_URL = (
 # ============================================================
 
 # Start checking from the 67th minute
-MINUTE_THRESHOLD = 67
+MINUTE_THRESHOLD = 65
 
 # Maximum acceptable odds
-ODDS_THRESHOLD = 1.05
+ODDS_THRESHOLD = 1.10
 
 # Required goal distance from current score
 #
