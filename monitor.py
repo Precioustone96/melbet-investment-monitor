@@ -1,60 +1,65 @@
 """
-MelBet Live Odds Monitor (API version)
-
-Built on the structure of the earlier script that worked on GitHub Actions:
-open the MelBet live page with Playwright, then read MelBet's own live-feed
-JSON instead of scraping the page's HTML.
+MelBet Live Football Monitor
 
 QUALIFICATION RULES:
 
-    - Live game in: Football, Tennis, Basketball, Hockey, Volleyball,
-      Handball, Baseball or Cricket
-    - Any available selection in the feed with decimal odds from 1.001 to
-      1.008, inclusive
-    - Virtual sports, simulations and esports are excluded
-    - At most 400 eligible games are checked per run
-    - A game already alerted today is skipped
+    - Football match
+    - Match minute >= 65
+    - Current score is used to calculate the required Total Goals line
+    - R goal distance = 4 by default
+    - Only UNDER Total Goals markets are considered
+    - Required Under line must be at least R goals away from the
+      current score
+    - Odds <= 1.1
 
-OUTPUT:
+Example:
 
-    - One email per qualifying game, subject "Investment Alert"
-    - One feedback email per run, subject "MelBet Monitor Feedback"
-      (control with FEEDBACK_MODE = always | problems | never)
-    - alerts.json   : date, last run, alerted game IDs (committed by workflow)
-    - last_scan.json: report of the last run
+    Minute: 65'
+    Score: 2-0
+    Current total: 2 goals
+    R: 4
 
-Usage:
-    python monitor.py              normal run
-    python monitor.py --dry-run    no emails, no alerts.json changes
-    python monitor.py --debug      also print feed URLs and sample fields
+    Required line:
+        2 + 4 - 0.5 = Under 5.5
 
-Time zone: Africa/Lagos (WAT)
+    Therefore:
+
+        Under 5.5 @ 1.10 -> QUALIFIES
+        Under 4.5 @ 1.11  -> DOES NOT QUALIFY
+
+When a match qualifies:
+    - Sends an email with subject "Investment Alert"
+    - Records the match ID in alerts.json
+    - Does not alert for that same match again on the same day
+
+alerts.json also records:
+    - Current calendar date
+    - Exact time of the last completed run
+    - Match IDs already alerted today
+
+Time zone:
+    Africa/Lagos (WAT)
 """
 
-import argparse
 import json
 import os
 import re
 import smtplib
 import sys
-import time
-import unicodedata
 from datetime import datetime
-from decimal import Decimal, InvalidOperation
 from email.mime.text import MIMEText
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
+
+from playwright.sync_api import sync_playwright
 
 
 # ============================================================
 # MELBET SETTINGS
 # ============================================================
 
-LIVE_BASE_URL = "https://melbet.com/en/live"
+LIVE_PAGE_URL = "https://melbet.com/en/live/football"
 
-# The football feed URL from the earlier working script. It is used only as
-# a fallback if the football page's own feed request cannot be captured.
-FOOTBALL_FALLBACK_API_URL = (
+GAMES_API_URL = (
     "https://melbet.com/service-api/main-live-feed/v3/games1x2"
     "?cfView=3"
     "&count=40"
@@ -66,59 +71,27 @@ FOOTBALL_FALLBACK_API_URL = (
     "&selectedMs=1.1,2.1,10.1"
 )
 
-# Display name -> live page slug on melbet.com/en/live/<slug>
-# If a sport returns nothing, run with --debug and check its slug.
-SPORTS = {
-    "Football": "football",
-    "Tennis": "tennis",
-    "Basketball": "basketball",
-    "Hockey": "ice-hockey",
-    "Volleyball": "volleyball",
-    "Handball": "handball",
-    "Baseball": "baseball",
-    "Cricket": "cricket",
-}
-
-# Names MelBet may use inside the feed for each of our sports
-SPORT_NAME_ALIASES = {
-    "football": "Football", "soccer": "Football",
-    "tennis": "Tennis", "lawn tennis": "Tennis",
-    "basketball": "Basketball",
-    "hockey": "Hockey", "ice hockey": "Hockey", "icehockey": "Hockey",
-    "volleyball": "Volleyball",
-    "handball": "Handball",
-    "baseball": "Baseball",
-    "cricket": "Cricket",
-}
-
 
 # ============================================================
 # ALERT CONDITIONS
 # ============================================================
 
-MIN_ODDS = Decimal("1.001")
-MAX_ODDS = Decimal("1.008")
+# Start checking from the 67th minute
+MINUTE_THRESHOLD = 65
 
-MAX_GAMES = 400
-REQUEST_COUNT = 400            # games requested per sport from the feed
-SCAN_TIMEOUT_SECONDS = 240     # whole-run budget; feedback is sent after
-CAPTURE_WAIT_SECONDS = 12      # wait for the page's own feed request
-SETTLE_WAIT_MS = 3000          # session/cookie settle time after navigation
+# Maximum acceptable odds
+ODDS_THRESHOLD = 1.10
 
-# Virtual sports, simulations and esports (checked against league, team and
-# sport names). "FIFA" alone is NOT blocked so the real World Cup stays in.
-EXCLUDED_LABELS = re.compile(
-    r"\b(?:virtual\w*|e[\s-]?sports?|cyber\w*|simulat\w*|srl|"
-    r"computer\s+generated|"
-    r"efootball|ebasketball|ehockey|esoccer|etennis|ecricket|"
-    r"e[\s-](?:soccer|football|basketball|hockey|tennis|cricket|"
-    r"volleyball|handball|baseball)|"
-    r"fifa\s*(?:\d{2}(?!\d)|online|volta|eworld|eclub)|"
-    r"ea\s*(?:sports\s*)?fc|pes\s*\d*|nba\s*2k\w*|nhl\s*\d{2}(?!\d)|"
-    r"madden\w*|dota\s*2?|counter[\s-]*strike\w*|cs\s*(?:2|go)|"
-    r"league\s+of\s+legends|valorant|rocket\s+league)\b",
-    re.IGNORECASE,
-)
+# Required goal distance from current score
+#
+# Example:
+# Current total = 2
+# R = 4
+#
+# Required Under line:
+# 2 + 4 - 0.5 = 5.5
+#
+GOAL_DISTANCE = 4
 
 
 # ============================================================
@@ -126,7 +99,8 @@ EXCLUDED_LABELS = re.compile(
 # ============================================================
 
 ALERTS_FILE = "alerts.json"
-REPORT_FILE = "last_scan.json"
+
+# Nigeria time
 TIMEZONE = ZoneInfo("Africa/Lagos")
 
 
@@ -134,16 +108,29 @@ TIMEZONE = ZoneInfo("Africa/Lagos")
 # EMAIL SETTINGS
 # ============================================================
 
-SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
-SMTP_USER = os.environ.get("SMTP_USER")
-SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
-ALERT_TO = os.environ.get("ALERT_TO")
+SMTP_HOST = os.environ.get(
+    "SMTP_HOST",
+    "smtp.gmail.com"
+)
 
-# always   = feedback email after every run
-# problems = only when the run failed or had issues
-# never    = no feedback email
-FEEDBACK_MODE = os.environ.get("FEEDBACK_MODE", "always").lower()
+SMTP_PORT = int(
+    os.environ.get(
+        "SMTP_PORT",
+        "587"
+    )
+)
+
+SMTP_USER = os.environ.get(
+    "SMTP_USER"
+)
+
+SMTP_PASSWORD = os.environ.get(
+    "SMTP_PASSWORD"
+)
+
+ALERT_TO = os.environ.get(
+    "ALERT_TO"
+)
 
 
 # ============================================================
@@ -151,539 +138,1197 @@ FEEDBACK_MODE = os.environ.get("FEEDBACK_MODE", "always").lower()
 # ============================================================
 
 def current_datetime():
+    """
+    Return current date/time in Nigeria.
+    """
     return datetime.now(TIMEZONE)
 
 
 def today_string():
+    """
+    Return today's date.
+
+    Example:
+        2026-09-13
+    """
     return current_datetime().date().isoformat()
 
 
 def timestamp_string():
-    return current_datetime().strftime("%Y-%m-%d %H:%M:%S WAT")
+    """
+    Return exact current Nigeria time.
+
+    Example:
+        2026-09-13 14:35:27 WAT
+    """
+    return current_datetime().strftime(
+        "%Y-%m-%d %H:%M:%S WAT"
+    )
 
 
 # ============================================================
 # ALERT STATE
 # ============================================================
 
-def new_state():
-    return {"date": today_string(), "last_run": None, "alerted_ids": []}
-
-
 def load_alerts():
-    """Load alerts.json; reset the alerted list on a new calendar day."""
+    """
+    Load alerts.json.
+
+    If the saved date is different from today,
+    the alerted match list is reset.
+
+    This allows the same match to qualify again
+    on a different calendar day.
+    """
+
+    today = today_string()
+
+    # --------------------------------------------------------
+    # File does not exist
+    # --------------------------------------------------------
+
     if not os.path.exists(ALERTS_FILE):
-        return new_state()
+
+        return {
+            "date": today,
+            "last_run": None,
+            "alerted_ids": []
+        }
+
+    # --------------------------------------------------------
+    # Read existing file
+    # --------------------------------------------------------
 
     try:
-        with open(ALERTS_FILE, "r", encoding="utf-8") as file:
+
+        with open(
+            ALERTS_FILE,
+            "r",
+            encoding="utf-8"
+        ) as file:
+
             data = json.load(file)
+
     except (json.JSONDecodeError, OSError):
-        print("WARNING: alerts.json could not be read. Creating new state.")
-        return new_state()
 
-    if not isinstance(data, dict) or data.get("date") != today_string():
-        print("New calendar day: resetting today's alerted game list.")
-        return new_state()
+        print(
+            "WARNING: alerts.json could not be read."
+        )
 
-    if not isinstance(data.get("alerted_ids"), list):
+        print(
+            "Creating a new alert state."
+        )
+
+        return {
+            "date": today,
+            "last_run": None,
+            "alerted_ids": []
+        }
+
+    # --------------------------------------------------------
+    # New day
+    # --------------------------------------------------------
+
+    if data.get("date") != today:
+
+        print(
+            "New calendar day detected."
+        )
+
+        print(
+            "Resetting today's alerted match list."
+        )
+
+        return {
+            "date": today,
+            "last_run": None,
+            "alerted_ids": []
+        }
+
+    # --------------------------------------------------------
+    # Validate alerted_ids
+    # --------------------------------------------------------
+
+    if not isinstance(
+        data.get("alerted_ids"),
+        list
+    ):
+
         data["alerted_ids"] = []
-    data.setdefault("last_run", None)
+
+    # --------------------------------------------------------
+    # Make sure last_run exists
+    # --------------------------------------------------------
+
+    if "last_run" not in data:
+
+        data["last_run"] = None
+
     return data
 
 
-def save_json(path, data):
-    temporary = path + ".tmp"
-    with open(temporary, "w", encoding="utf-8") as file:
-        json.dump(data, file, indent=2, ensure_ascii=False)
-    os.replace(temporary, path)
+def save_alerts(data):
+    """
+    Save current alert state to alerts.json.
+    """
+
+    with open(
+        ALERTS_FILE,
+        "w",
+        encoding="utf-8"
+    ) as file:
+
+        json.dump(
+            data,
+            file,
+            indent=2
+        )
+
+    print(
+        "alerts.json updated successfully."
+    )
 
 
 # ============================================================
-# EMAIL
+# MATCH MINUTE
 # ============================================================
 
-def send_email(subject, body):
-    for name, value in (("SMTP_USER", SMTP_USER),
-                        ("SMTP_PASSWORD", SMTP_PASSWORD),
-                        ("ALERT_TO", ALERT_TO)):
-        if not value:
-            raise RuntimeError(f"{name} is not configured.")
+def get_match_minute(match):
+    """
+    Extract match minute from:
 
-    message = MIMEText(body, "plain", "utf-8")
-    message["Subject"] = subject
-    message["From"] = SMTP_USER
-    message["To"] = ALERT_TO
+        scores.statusLineStr
 
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
-        server.ehlo()
-        server.starttls()
-        server.ehlo()
-        server.login(SMTP_USER, SMTP_PASSWORD)
-        server.send_message(message)
+    Example:
 
+        "67 minutes"
 
-# ============================================================
-# FEED HELPERS
-# ============================================================
+    Returns:
+        67
+    """
 
-def clean_text(value):
-    if not isinstance(value, str):
-        return ""
-    return unicodedata.normalize("NFKC", value).strip()
+    scores = match.get(
+        "scores"
+    ) or {}
 
+    status = scores.get(
+        "statusLineStr",
+        ""
+    )
 
-def nested_name(value):
-    """Return a name from either a string or a dict with a name-like key."""
-    if isinstance(value, str):
-        return clean_text(value)
-    if isinstance(value, dict):
-        for key in ("fullName", "name", "title", "nameEng"):
-            text = clean_text(value.get(key))
-            if text:
-                return text
-    return ""
+    if not status:
 
-
-def game_id(match):
-    value = match.get("id") or match.get("mainGameId")
-    return None if value is None else str(value)
-
-
-def team_names(match):
-    one = nested_name(match.get("opponent1")) or "Unknown"
-    two = nested_name(match.get("opponent2")) or "Unknown"
-    return one, two
-
-
-def league_name(match):
-    return nested_name(match.get("liga")) or nested_name(match.get("league")) \
-        or "Unknown League"
-
-
-def feed_sport_name(match):
-    """Sport name reported inside the game object, or '' if not present."""
-    for key in ("sportName", "sportNameEng", "sport", "sportTitle"):
-        name = nested_name(match.get(key))
-        if name:
-            return name
-    return ""
-
-
-def canonical_sport(name):
-    return SPORT_NAME_ALIASES.get(clean_text(name).casefold())
-
-
-def is_excluded(match, sport_label):
-    """True for virtual / simulated / esports games."""
-    one, two = team_names(match)
-    text = " | ".join((league_name(match), one, two,
-                       feed_sport_name(match), sport_label))
-    text = re.sub(r"[_/]+", " ", text)
-    return bool(EXCLUDED_LABELS.search(text))
-
-
-def to_decimal(value):
-    if value is None or isinstance(value, (dict, list, bool)):
-        return None
-    try:
-        return Decimal(str(value).strip())
-    except (InvalidOperation, ValueError):
         return None
 
+    minute_match = re.search(
+        r"(\d+)\s*minutes?",
+        status,
+        re.IGNORECASE
+    )
 
-def iter_events(node, market=""):
-    """
-    Walk a game object and yield (event, market_name) for every dict that
-    carries odds ("cf"). This covers every market the feed contains.
-    """
-    if isinstance(node, dict):
-        name = clean_text(node.get("groupName") or node.get("groupNameEng"))
-        if name:
-            market = name
-        elif node.get("groupId") is not None and "events" in node:
-            market = f"Market group {node['groupId']}"
+    if minute_match:
 
-        if "cf" in node and not isinstance(node["cf"], (dict, list)):
-            yield node, market
+        return int(
+            minute_match.group(1)
+        )
 
-        for value in node.values():
-            if isinstance(value, (dict, list)):
-                yield from iter_events(value, market)
-
-    elif isinstance(node, list):
-        for item in node:
-            yield from iter_events(item, market)
-
-
-def is_blocked(event):
-    for key in ("blocked", "isBlocked", "locked", "suspended"):
-        if event.get(key) is True:
-            return True
-    return False
-
-
-def describe_selection(event):
-    name = (clean_text(event.get("name")) or clean_text(event.get("shortName"))
-            or f"type {event.get('type', '?')}")
-    parameter = event.get("parameter")
-    if parameter not in (None, "") and str(parameter) not in name:
-        name = f"{name} {parameter}"
-    return name
-
-
-def find_qualifying(match):
-    """Every available selection with odds from MIN_ODDS to MAX_ODDS."""
-    found, seen = [], set()
-    for event, market in iter_events(match):
-        odds = to_decimal(event.get("cf"))
-        if odds is None or not (MIN_ODDS <= odds <= MAX_ODDS):
-            continue
-        if is_blocked(event):
-            continue
-        item = (market or "Market", describe_selection(event), str(odds))
-        if item not in seen:
-            seen.add(item)
-            found.append({"market": item[0], "selection": item[1],
-                          "odds": item[2]})
-    return found
-
-
-def extract_matches(payload):
-    """Accept a plain list or a dict wrapping the list."""
-    if isinstance(payload, list):
-        return payload
-    if isinstance(payload, dict):
-        for key in ("items", "games", "Value", "value", "data", "result"):
-            if isinstance(payload.get(key), list):
-                return payload[key]
     return None
 
 
-def with_count(url, count):
-    """Return the feed URL with its count parameter raised."""
-    parts = urlsplit(url)
-    query = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
-             if k != "count"]
-    query.append(("count", str(count)))
-    return urlunsplit((parts.scheme, parts.netloc, parts.path,
-                       urlencode(query, safe=","), parts.fragment))
-
-
 # ============================================================
-# FETCHING (Playwright: open page, then read the page's own feed)
+# SCORE PARSING
 # ============================================================
 
-def capture_feed_url(page, slug, debug):
+def get_current_total_goals(match):
     """
-    Open the sport's live page and capture the live-feed request that the
-    page itself makes. This avoids guessing sport IDs or parameters.
+    Extract the current score and calculate
+    the current total number of goals.
+
+    Example:
+
+        fullScore = "2:0"
+
+        Current total = 2
+
+    Another possible format:
+
+        "2-0"
+
+    Returns:
+        integer total goals
+
+    Returns None if the score cannot be parsed.
     """
-    captured = []
 
-    def on_response(response):
-        url = response.url
-        if "main-live-feed" in url and "/games" in url:
-            captured.append(url)
+    scores = match.get(
+        "scores"
+    ) or {}
 
-    page.on("response", on_response)
-    try:
-        try:
-            page.goto(f"{LIVE_BASE_URL}/{slug}", wait_until="commit",
-                      timeout=30000)
-        except Exception as error:
-            print(f"  Navigation note for '{slug}': {error}")
-
-        deadline = time.time() + CAPTURE_WAIT_SECONDS
-        while time.time() < deadline and not captured:
-            page.wait_for_timeout(500)
-        page.wait_for_timeout(SETTLE_WAIT_MS if captured else 0)
-    finally:
-        page.remove_listener("response", on_response)
-
-    if debug:
-        print(f"  Captured feed URLs for '{slug}': {captured}")
-
-    preferred = [url for url in captured if "games1x2" in url]
-    if preferred:
-        return preferred[-1]
-    return captured[-1] if captured else None
-
-
-def fetch_sport(page, sport, slug, debug):
-    """Return (matches, feed_url, error_message)."""
-    feed_url = capture_feed_url(page, slug, debug)
-    source = "page feed"
-
-    if not feed_url and sport == "Football":
-        feed_url = FOOTBALL_FALLBACK_API_URL
-        source = "fallback URL"
-
-    if not feed_url:
-        return [], None, f"{sport}: live feed was not found on the page."
-
-    url = with_count(feed_url, REQUEST_COUNT)
-    try:
-        response = page.request.get(url, timeout=60000)
-    except Exception as error:
-        return [], url, f"{sport}: feed request failed ({error})."
-
-    if not response.ok:
-        return [], url, f"{sport}: feed returned HTTP {response.status} ({source})."
-
-    try:
-        payload = response.json()
-    except Exception:
-        return [], url, f"{sport}: feed did not return JSON."
-
-    matches = extract_matches(payload)
-    if matches is None:
-        return [], url, f"{sport}: unexpected feed format ({type(payload).__name__})."
-
-    if debug and matches and isinstance(matches[0], dict):
-        print(f"  {sport} sample keys: {sorted(matches[0].keys())[:40]}")
-    return matches, url, None
-
-
-# ============================================================
-# ALERT EMAIL BODY
-# ============================================================
-
-def alert_body(sport, match, lines):
-    one, two = team_names(match)
-    scores = match.get("scores") or {}
-    score = scores.get("fullScore", "?")
-    status = scores.get("statusLineStr", "")
-    selections = "\n".join(
-        f"- {item['market']}: {item['selection']} @ {item['odds']}"
-        for item in lines
+    full_score = scores.get(
+        "fullScore"
     )
-    return f"""
+
+    if not full_score:
+
+        return None
+
+    # Convert unusual separators to a standard format
+    cleaned_score = str(
+        full_score
+    ).strip()
+
+    # Find two score numbers.
+    #
+    # Handles examples such as:
+    #   2:0
+    #   2-0
+    #   2 : 0
+    #   2 - 0
+    #
+    score_match = re.search(
+        r"(\d+)\s*[-:]\s*(\d+)",
+        cleaned_score
+    )
+
+    if not score_match:
+
+        return None
+
+    try:
+
+        home_goals = int(
+            score_match.group(1)
+        )
+
+        away_goals = int(
+            score_match.group(2)
+        )
+
+    except ValueError:
+
+        return None
+
+    return home_goals + away_goals
+
+
+def get_score_string(match):
+    """
+    Return the score exactly as provided by MelBet.
+    """
+
+    scores = match.get(
+        "scores"
+    ) or {}
+
+    return scores.get(
+        "fullScore",
+        "?"
+    )
+
+
+# ============================================================
+# REQUIRED UNDER LINE
+# ============================================================
+
+def calculate_required_under_line(
+    current_total_goals
+):
+    """
+    Calculate the minimum qualifying Under line.
+
+    Formula:
+
+        current total + GOAL_DISTANCE - 0.5
+
+    Example:
+
+        Current total = 2
+        GOAL_DISTANCE = 4
+
+        2 + 4 - 0.5
+        = 5.5
+
+        Required market = Under 5.5
+    """
+
+    return (
+        current_total_goals
+        + GOAL_DISTANCE
+        - 0.5
+    )
+
+
+# ============================================================
+# EXTRACT NUMERIC TOTAL GOALS PARAMETER
+# ============================================================
+
+def parse_parameter(parameter):
+    """
+    Convert a Total Goals parameter into a number.
+
+    Examples:
+
+        "5.5" -> 5.5
+        5.5   -> 5.5
+        "5"   -> 5.0
+
+    Returns None if it cannot be converted.
+    """
+
+    if parameter is None:
+
+        return None
+
+    try:
+
+        return float(
+            str(parameter).strip()
+        )
+
+    except (
+        TypeError,
+        ValueError
+    ):
+
+        return None
+
+
+# ============================================================
+# FIND QUALIFYING TOTAL GOALS LINES
+# ============================================================
+
+def find_qualifying_lines(match):
+    """
+    Find qualifying UNDER Total Goals options.
+
+    Conditions:
+
+        1. groupId == 17
+           = Total Goals
+
+        2. type == 10
+           = Under
+
+        3. Under line >= required line
+
+        4. Odds <= 1.02
+    """
+
+    qualifying_lines = []
+
+    # --------------------------------------------------------
+    # Current score
+    # --------------------------------------------------------
+
+    current_total_goals = (
+        get_current_total_goals(
+            match
+        )
+    )
+
+    if current_total_goals is None:
+
+        print(
+            "Could not parse current score "
+            "for a match."
+        )
+
+        return qualifying_lines
+
+    # --------------------------------------------------------
+    # Calculate required line
+    # --------------------------------------------------------
+
+    required_under_line = (
+        calculate_required_under_line(
+            current_total_goals
+        )
+    )
+
+    print(
+        f"Current total goals: "
+        f"{current_total_goals}"
+    )
+
+    print(
+        f"Required Under line: "
+        f"{required_under_line}"
+    )
+
+    # --------------------------------------------------------
+    # Get Total Goals group
+    # --------------------------------------------------------
+
+    groups = match.get(
+        "centralBlockEventGroups",
+        []
+    )
+
+    if not isinstance(
+        groups,
+        list
+    ):
+
+        return qualifying_lines
+
+    for group in groups:
+
+        if not isinstance(
+            group,
+            dict
+        ):
+
+            continue
+
+        # groupId 17 = Total Goals
+        if group.get(
+            "groupId"
+        ) != 17:
+
+            continue
+
+        events = group.get(
+            "events",
+            []
+        )
+
+        if not isinstance(
+            events,
+            list
+        ):
+
+            continue
+
+        for event_group in events:
+
+            if not isinstance(
+                event_group,
+                list
+            ):
+
+                continue
+
+            for event in event_group:
+
+                if not isinstance(
+                    event,
+                    dict
+                ):
+
+                    continue
+
+                # ------------------------------------------------
+                # ONLY UNDER
+                # type 10 = Under
+                # ------------------------------------------------
+
+                if event.get(
+                    "type"
+                ) != 10:
+
+                    continue
+
+                odd = event.get(
+                    "cf"
+                )
+
+                if odd is None:
+
+                    continue
+
+                try:
+
+                    odd = float(
+                        odd
+                    )
+
+                except (
+                    TypeError,
+                    ValueError
+                ):
+
+                    continue
+
+                # ------------------------------------------------
+                # ODDS CONDITION
+                # ------------------------------------------------
+
+                if odd > ODDS_THRESHOLD:
+
+                    continue
+
+                # ------------------------------------------------
+                # TOTAL GOALS PARAMETER
+                # ------------------------------------------------
+
+                parameter = event.get(
+                    "parameter"
+                )
+
+                parameter_number = (
+                    parse_parameter(
+                        parameter
+                    )
+                )
+
+                if parameter_number is None:
+
+                    continue
+
+                # ------------------------------------------------
+                # GOAL DISTANCE CONDITION
+                # ------------------------------------------------
+
+                if (
+                    parameter_number
+                    < required_under_line
+                ):
+
+                    continue
+
+                # ------------------------------------------------
+                # QUALIFIES
+                # ------------------------------------------------
+
+                qualifying_lines.append({
+
+                    "side": "Under",
+
+                    "parameter": parameter,
+
+                    "odd": odd,
+
+                    "required_line":
+                        required_under_line,
+
+                    "current_total":
+                        current_total_goals
+                })
+
+    return qualifying_lines
+
+
+# ============================================================
+# SEND EMAIL
+# ============================================================
+
+def send_email(body):
+    """
+    Send investment alert email.
+
+    Subject is ALWAYS:
+
+        Investment Alert
+    """
+
+    if not SMTP_USER:
+
+        raise RuntimeError(
+            "SMTP_USER is not configured."
+        )
+
+    if not SMTP_PASSWORD:
+
+        raise RuntimeError(
+            "SMTP_PASSWORD is not configured."
+        )
+
+    if not ALERT_TO:
+
+        raise RuntimeError(
+            "ALERT_TO is not configured."
+        )
+
+    message = MIMEText(
+        body,
+        "plain",
+        "utf-8"
+    )
+
+    # Exact requested subject
+    message["Subject"] = (
+        "Investment Alert"
+    )
+
+    message["From"] = SMTP_USER
+    message["To"] = ALERT_TO
+
+    with smtplib.SMTP(
+        SMTP_HOST,
+        SMTP_PORT,
+        timeout=30
+    ) as server:
+
+        server.ehlo()
+
+        server.starttls()
+
+        server.ehlo()
+
+        server.login(
+            SMTP_USER,
+            SMTP_PASSWORD
+        )
+
+        server.send_message(
+            message
+        )
+
+
+# ============================================================
+# CHECK ALL LIVE MATCHES
+# ============================================================
+
+def check_matches(
+    matches,
+    alerts_data
+):
+    """
+    Check all live matches.
+
+    Qualification:
+
+        Minute >= 65
+
+        AND
+
+        Under Total Goals line is at least
+        R goals away from the current score
+
+        AND
+
+        Odds <= 1.10
+
+    R is controlled by:
+
+        GOAL_DISTANCE = 4
+
+    Once the email successfully sends,
+    the match ID is recorded for the day.
+    """
+
+    alerted_ids = set(
+        str(match_id)
+        for match_id in alerts_data.get(
+            "alerted_ids",
+            []
+        )
+    )
+
+    new_alerts = 0
+
+    for match in matches:
+
+        if not isinstance(
+            match,
+            dict
+        ):
+
+            continue
+
+        # ----------------------------------------------------
+        # MATCH ID
+        # ----------------------------------------------------
+
+        match_id = (
+            match.get("id")
+            or match.get("mainGameId")
+        )
+
+        if match_id is None:
+
+            continue
+
+        match_id = str(
+            match_id
+        )
+
+        # ----------------------------------------------------
+        # ALREADY ALERTED TODAY?
+        # ----------------------------------------------------
+
+        if match_id in alerted_ids:
+
+            continue
+
+        # ----------------------------------------------------
+        # CHECK MINUTE
+        # ----------------------------------------------------
+
+        minute = get_match_minute(
+            match
+        )
+
+        if minute is None:
+
+            continue
+
+        if minute < MINUTE_THRESHOLD:
+
+            continue
+
+        # ----------------------------------------------------
+        # GET SCORE
+        # ----------------------------------------------------
+
+        current_total_goals = (
+            get_current_total_goals(
+                match
+            )
+        )
+
+        if current_total_goals is None:
+
+            print(
+                f"Could not parse score "
+                f"for match {match_id}."
+            )
+
+            continue
+
+        # ----------------------------------------------------
+        # FIND QUALIFYING MARKET
+        # ----------------------------------------------------
+
+        qualifying_lines = (
+            find_qualifying_lines(
+                match
+            )
+        )
+
+        if not qualifying_lines:
+
+            continue
+
+        # ----------------------------------------------------
+        # MATCH INFORMATION
+        # ----------------------------------------------------
+
+        opponent1 = (
+            match.get(
+                "opponent1"
+            ) or {}
+        ).get(
+            "fullName",
+            "Unknown Team"
+        )
+
+        opponent2 = (
+            match.get(
+                "opponent2"
+            ) or {}
+        ).get(
+            "fullName",
+            "Unknown Team"
+        )
+
+        league = (
+            match.get(
+                "liga"
+            ) or {}
+        ).get(
+            "name",
+            "Unknown League"
+        )
+
+        score = get_score_string(
+            match
+        )
+
+        required_under_line = (
+            calculate_required_under_line(
+                current_total_goals
+            )
+        )
+
+        # ----------------------------------------------------
+        # FORMAT QUALIFYING LINES
+        # ----------------------------------------------------
+
+        lines = []
+
+        for line in qualifying_lines:
+
+            lines.append(
+                f"{line['side']} "
+                f"{line['parameter']} "
+                f"@ {line['odd']}"
+            )
+
+        qualifying_text = (
+            "\n".join(lines)
+        )
+
+        # ----------------------------------------------------
+        # EMAIL BODY
+        # ----------------------------------------------------
+
+        email_body = f"""
 INVESTMENT ALERT
 
-Sport: {sport}
-League: {league_name(match)}
+League: {league}
 
 Match:
-{one} vs {two}
+{opponent1} vs {opponent2}
 
+Minute: {minute}'
 Score: {score}
-Status: {status or 'live'}
 
-Selection(s) with odds {MIN_ODDS} to {MAX_ODDS}:
-{selections}
+Current total goals:
+{current_total_goals}
 
-Game ID: {game_id(match)}
-Alert time: {timestamp_string()}
+Required goal distance:
+{GOAL_DISTANCE} goals
+
+Minimum qualifying Under line:
+Under {required_under_line}
+
+Qualifying Total Goals Option(s):
+
+{qualifying_text}
+
+Match ID:
+{match_id}
+
+Conditions:
+Minute >= {MINUTE_THRESHOLD}
+Goal distance >= {GOAL_DISTANCE}
+Odds <= {ODDS_THRESHOLD}
+
+Alert Time:
+{timestamp_string()}
 """.strip()
 
+        # ----------------------------------------------------
+        # PRINT ALERT
+        # ----------------------------------------------------
 
-# ============================================================
-# REPORT
-# ============================================================
+        print(
+            "\n" + "=" * 60
+        )
 
-def format_report(report):
-    status = report["status"].upper()
-    lines = [
-        "MELBET MONITOR FEEDBACK",
-        f"Status: {status}",
-        f"Time: {report['finished_at']}",
-        f"Sports monitored: {', '.join(SPORTS)}",
-        f"Odds range: {MIN_ODDS} to {MAX_ODDS} inclusive",
-        f"Scan duration: {report['duration']} seconds",
-        f"Live games selected: {report['selected']} / {MAX_GAMES}",
-        f"Games checked: {report['checked']}",
-        f"Skipped (already alerted today): {report['skipped_alerted']}",
-        f"Skipped (virtual / esports / simulated): {report['skipped_excluded']}",
-        f"Skipped (duplicate or other sport): {report['skipped_other']}",
-        f"Games with qualifying odds: {report['matches']}",
-        f"Game alerts delivered: {report['alerts_sent']}",
-        "",
-        "Per sport (received / selected):",
-    ]
-    for sport, counts in report["per_sport"].items():
-        lines.append(f"- {sport}: {counts['received']} / {counts['selected']}")
+        print(
+            "QUALIFYING MATCH FOUND"
+        )
 
-    if report["budget_hit"]:
-        lines.append("")
-        lines.append("Time budget reached: partial scan; remaining sports skipped.")
-    if report["matches"] == 0 and report["status"] != "failed":
-        lines.append("")
-        lines.append("No qualifying odds found in the games checked.")
-    if report["errors"]:
-        lines.append("")
-        lines.append("Issues:")
-        lines.extend(f"- {error}" for error in report["errors"][:15])
-    return "\n".join(lines)
+        print(
+            "=" * 60
+        )
+
+        print(
+            email_body
+        )
+
+        print(
+            "=" * 60
+        )
+
+        # ----------------------------------------------------
+        # SEND EMAIL
+        # ----------------------------------------------------
+
+        try:
+
+            send_email(
+                email_body
+            )
+
+            print(
+                "Email sent successfully."
+            )
+
+            # ------------------------------------------------
+            # IMPORTANT:
+            #
+            # Only mark the match as alerted AFTER
+            # the email successfully sends.
+            # ------------------------------------------------
+
+            alerted_ids.add(
+                match_id
+            )
+
+            new_alerts += 1
+
+        except Exception as error:
+
+            print(
+                "EMAIL FAILED:"
+            )
+
+            print(
+                error
+            )
+
+            print(
+                "Match was NOT added "
+                "to alerted_ids."
+            )
+
+            print(
+                "The monitor will retry it "
+                "on the next run if it qualifies."
+            )
+
+    # --------------------------------------------------------
+    # Save IDs back into state
+    # --------------------------------------------------------
+
+    alerts_data["alerted_ids"] = sorted(
+        alerted_ids
+    )
+
+    return new_alerts
 
 
 # ============================================================
 # MAIN MONITOR
 # ============================================================
 
-def run(args):
-    from playwright.sync_api import sync_playwright
+def main():
 
-    started = time.time()
+    print(
+        "=" * 60
+    )
+
+    print(
+        "MELBET INVESTMENT MONITOR"
+    )
+
+    print(
+        "=" * 60
+    )
+
+    print(
+        f"Run started: "
+        f"{timestamp_string()}"
+    )
+
+    print(
+        f"Minimum minute: "
+        f"{MINUTE_THRESHOLD}"
+    )
+
+    print(
+        f"Goal distance (R): "
+        f"{GOAL_DISTANCE}"
+    )
+
+    print(
+        f"Maximum odds: "
+        f"{ODDS_THRESHOLD}"
+    )
+
+    # --------------------------------------------------------
+    # LOAD ALERT STATE
+    # --------------------------------------------------------
+
     alerts_data = load_alerts()
-    alerted_ids = {str(item) for item in alerts_data.get("alerted_ids", [])}
 
-    print("=" * 60)
-    print("MELBET LIVE ODDS MONITOR")
-    print("=" * 60)
-    print(f"Run started: {timestamp_string()}")
-    print(f"Odds range: {MIN_ODDS} to {MAX_ODDS}")
-    print(f"Previously alerted games today: {len(alerted_ids)}")
-    if args.dry_run:
-        print("DRY RUN: no emails and no state changes.")
+    print(
+        f"Alert date: "
+        f"{alerts_data['date']}"
+    )
 
-    report = {
-        "selected": 0, "checked": 0, "matches": 0, "alerts_sent": 0,
-        "skipped_alerted": 0, "skipped_excluded": 0, "skipped_other": 0,
-        "per_sport": {}, "errors": [], "budget_hit": False,
-    }
-    seen_ids = set()
-    sports_read = 0
+    print(
+        f"Previously alerted matches today: "
+        f"{len(alerts_data['alerted_ids'])}"
+    )
 
-    with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=True)
-        page = browser.new_page(viewport={"width": 1440, "height": 1000})
+    # --------------------------------------------------------
+    # START PLAYWRIGHT
+    # --------------------------------------------------------
+
+    with sync_playwright() as p:
+
+        browser = p.chromium.launch(
+            headless=True
+        )
+
+        page = browser.new_page(
+            viewport={
+                "width": 1440,
+                "height": 1000
+            }
+        )
 
         try:
-            for sport, slug in SPORTS.items():
-                if report["selected"] >= MAX_GAMES:
-                    break
-                if time.time() - started > SCAN_TIMEOUT_SECONDS:
-                    report["budget_hit"] = True
-                    break
 
-                print(f"\nReading {sport} ...")
-                matches, feed_url, error = fetch_sport(page, sport, slug, args.debug)
-                counts = {"received": len(matches), "selected": 0}
-                report["per_sport"][sport] = counts
+            # =================================================
+            # OPEN MELBET
+            # =================================================
 
-                if error:
-                    print(f"  {error}")
-                    report["errors"].append(error)
-                    continue
+            print(
+                "Opening MelBet live football page..."
+            )
 
-                sports_read += 1
-                print(f"  Games received: {len(matches)}")
+            # -------------------------------------------------
+            # IMPORTANT FIX:
+            #
+            # Do NOT wait for "domcontentloaded".
+            #
+            # MelBet can keep the page/network activity
+            # running long enough to cause a 60-second
+            # Playwright timeout on GitHub Actions.
+            #
+            # "commit" lets navigation establish without
+            # waiting for the entire page to finish loading.
+            # -------------------------------------------------
 
-                for match in matches:
-                    if report["selected"] >= MAX_GAMES:
-                        break
-                    if not isinstance(match, dict):
-                        continue
+            try:
 
-                    gid = game_id(match)
-                    if gid is None or gid in seen_ids:
-                        report["skipped_other"] += 1
-                        continue
+                page.goto(
+                    LIVE_PAGE_URL,
+                    wait_until="commit",
+                    timeout=30000
+                )
 
-                    # If the game states its sport and it is a different one,
-                    # the feed ignored our sport filter: skip it here.
-                    reported = canonical_sport(feed_sport_name(match))
-                    if reported and reported != sport:
-                        report["skipped_other"] += 1
-                        continue
+                print(
+                    "MelBet page connection established."
+                )
 
-                    seen_ids.add(gid)
+            except Exception as error:
 
-                    if is_excluded(match, sport):
-                        report["skipped_excluded"] += 1
-                        continue
-                    if gid in alerted_ids:
-                        report["skipped_alerted"] += 1
-                        continue
+                print(
+                    "WARNING: MelBet page navigation "
+                    "did not complete normally."
+                )
 
-                    report["selected"] += 1
-                    counts["selected"] += 1
-                    report["checked"] += 1
+                print(
+                    f"Navigation message: {error}"
+                )
 
-                    lines = find_qualifying(match)
-                    if not lines:
-                        continue
+                print(
+                    "Continuing to the live-feed API..."
+                )
 
-                    report["matches"] += 1
-                    body = alert_body(sport, match, lines)
-                    print("\n" + "=" * 60)
-                    print("QUALIFYING GAME FOUND")
-                    print("=" * 60)
-                    print(body)
+            # Give MelBet a few seconds to establish
+            # the browser session/cookies.
+            page.wait_for_timeout(
+                5000
+            )
 
-                    if args.dry_run:
-                        continue
-                    try:
-                        send_email("Investment Alert", body)
-                        alerted_ids.add(gid)
-                        report["alerts_sent"] += 1
-                        print("Email sent successfully.")
-                    except Exception as email_error:
-                        message = f"Alert email failed for game {gid}: {email_error}"
-                        print(message)
-                        report["errors"].append(message)
+            # =================================================
+            # FETCH LIVE DATA
+            # =================================================
+
+            print(
+                "Fetching live match data..."
+            )
+
+            response = page.request.get(
+                GAMES_API_URL,
+                timeout=60000
+            )
+
+            # ------------------------------------------------
+            # CHECK API RESPONSE
+            # ------------------------------------------------
+
+            if not response.ok:
+
+                print(
+                    f"API request failed: "
+                    f"{response.status}"
+                )
+
+                sys.exit(1)
+
+            # ------------------------------------------------
+            # READ JSON
+            # ------------------------------------------------
+
+            matches = response.json()
+
+            if not isinstance(
+                matches,
+                list
+            ):
+
+                print(
+                    "Unexpected API response format."
+                )
+
+                print(
+                    f"Response type: "
+                    f"{type(matches)}"
+                )
+
+                sys.exit(1)
+
+            print(
+                f"Live matches received: "
+                f"{len(matches)}"
+            )
+
+            # =================================================
+            # CHECK MATCHES
+            # =================================================
+
+            new_alerts = check_matches(
+                matches,
+                alerts_data
+            )
+
+            print(
+                f"New alerts sent: "
+                f"{new_alerts}"
+            )
+
         finally:
+
             browser.close()
 
-    # --------------------------------------------------------
-    # Final status
-    # --------------------------------------------------------
-    if sports_read == 0:
-        report["status"] = "failed"
-    elif report["errors"] or report["budget_hit"]:
-        report["status"] = "partial"
-    else:
-        report["status"] = "complete"
+    # ========================================================
+    # RECORD LAST COMPLETED RUN
+    # ========================================================
 
-    report["duration"] = round(time.time() - started, 1)
-    report["finished_at"] = timestamp_string()
-    text = format_report(report)
-    print("\n" + text)
+    alerts_data["last_run"] = (
+        timestamp_string()
+    )
 
-    # --------------------------------------------------------
-    # Feedback email
-    # --------------------------------------------------------
-    feedback_failed = False
-    wanted = (FEEDBACK_MODE == "always"
-              or (FEEDBACK_MODE == "problems" and report["status"] != "complete"))
-    if wanted and not args.dry_run:
-        try:
-            send_email("MelBet Monitor Feedback", text)
-            print("Feedback email sent.")
-        except Exception as error:
-            feedback_failed = True
-            print(f"Feedback email failed: {error}")
+    alerts_data["date"] = (
+        today_string()
+    )
 
-    # --------------------------------------------------------
-    # Save state
-    # --------------------------------------------------------
-    if not args.dry_run:
-        alerts_data["date"] = today_string()
-        alerts_data["alerted_ids"] = sorted(alerted_ids)
-        alerts_data["last_run"] = report["finished_at"]
-        alerts_data["last_status"] = report["status"]
-        save_json(ALERTS_FILE, alerts_data)
-        save_json(REPORT_FILE, report)
-        print("alerts.json updated.")
+    # ========================================================
+    # SAVE ALERT STATE
+    # ========================================================
 
-    return 1 if report["status"] == "failed" or feedback_failed else 0
+    save_alerts(
+        alerts_data
+    )
+
+    # ========================================================
+    # FINAL STATUS
+    # ========================================================
+
+    print(
+        f"Last run recorded as: "
+        f"{alerts_data['last_run']}"
+    )
+
+    print(
+        f"Total alerted matches today: "
+        f"{len(alerts_data['alerted_ids'])}"
+    )
+
+    print(
+        "=" * 60
+    )
+
+    print(
+        "MONITOR FINISHED SUCCESSFULLY"
+    )
+
+    print(
+        "=" * 60
+    )
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__,
-                                     formatter_class=argparse.RawTextHelpFormatter)
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Print matches; no emails, no file writes.")
-    parser.add_argument("--debug", action="store_true",
-                        help="Print captured feed URLs and sample fields.")
-    args = parser.parse_args()
-    return run(args)
-
+# ============================================================
+# START PROGRAM
+# ============================================================
 
 if __name__ == "__main__":
-    try:
-        sys.exit(main())
-    except Exception as error:
-        print(f"MONITOR FAILED: {error}", file=sys.stderr)
-        sys.exit(1)
+    main()
