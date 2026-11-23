@@ -5,12 +5,11 @@ on:
     types: [run-monitor]
   schedule:
     - cron: "*/5 * * * *"
-
   workflow_dispatch:
 
 concurrency:
   group: melbet-monitor
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -18,24 +17,23 @@ permissions:
 jobs:
   poll:
     runs-on: ubuntu-latest
-
     timeout-minutes: 10
 
     steps:
-
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
+          cache: pip
 
       - name: Restore Playwright browser cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cache/ms-playwright
-          key: playwright-chromium-${{ runner.os }}-v1
+          key: playwright-chromium-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
 
       - name: Install dependencies
         run: |
@@ -62,5 +60,6 @@ jobs:
             echo "No alert state changes to commit."
           else
             git commit -m "Update alerts state"
+            git pull --rebase
             git push
           fi
